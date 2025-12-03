@@ -95,3 +95,158 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import os
+import gzip
+import pickle
+import json
+
+import numpy as np
+import pandas as pd
+
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+)
+
+def save_model_gzip(obj, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with gzip.open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+
+def write_metrics_jsonlines(rows, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+grading_dir = "files/grading"
+use_grading = os.path.exists(os.path.join(grading_dir, "x_train.pkl"))
+
+if use_grading:
+    with open(os.path.join(grading_dir, "x_train.pkl"), "rb") as f:
+        X_train = pickle.load(f)
+    with open(os.path.join(grading_dir, "y_train.pkl"), "rb") as f:
+        y_train = pickle.load(f)
+    with open(os.path.join(grading_dir, "x_test.pkl"), "rb") as f:
+        X_test = pickle.load(f)
+    with open(os.path.join(grading_dir, "y_test.pkl"), "rb") as f:
+        y_test = pickle.load(f)
+else:
+    train = pd.read_csv("files/input/train_data.csv.zip", compression="zip")
+    test = pd.read_csv("files/input/test_data.csv.zip", compression="zip")
+
+    train = train.rename(columns={"default payment next month": "default"})
+    test = test.rename(columns={"default payment next month": "default"})
+    if "ID" in train.columns:
+        train = train.drop(columns=["ID"])
+    if "ID" in test.columns:
+        test = test.drop(columns=["ID"])
+
+    train = train.replace(" ", np.nan).dropna()
+    test = test.replace(" ", np.nan).dropna()
+
+    if "EDUCATION" in train.columns:
+        train["EDUCATION"] = train["EDUCATION"].apply(lambda x: x if x <= 4 else 4)
+    if "EDUCATION" in test.columns:
+        test["EDUCATION"] = test["EDUCATION"].apply(lambda x: x if x <= 4 else 4)
+
+    X_train = train.drop(columns=["default"])
+    y_train = train["default"]
+    X_test = test.drop(columns=["default"])
+    y_test = test["default"]
+
+if not isinstance(X_train, pd.DataFrame):
+    X_train = pd.DataFrame(X_train)
+if not isinstance(X_test, pd.DataFrame):
+    X_test = pd.DataFrame(X_test)
+
+candidates_cat = ["SEX", "EDUCATION", "MARRIAGE"]
+categorical = [c for c in candidates_cat if c in X_train.columns]
+numeric = [c for c in X_train.columns if c not in categorical]
+
+transformers = []
+if categorical:
+    transformers.append(("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), categorical))
+if numeric:
+    transformers.append(("num", MinMaxScaler(), numeric))
+
+preprocessor = ColumnTransformer(transformers=transformers)
+
+pipeline = Pipeline(
+    steps=[
+        ("pre", preprocessor),
+        ("select", SelectKBest(score_func=f_classif)),
+        ("clf", LogisticRegression(max_iter=1000, solver="liblinear")),
+    ]
+)
+
+param_grid = {
+    "select__k": [10, 15, 20, "all"],
+    "clf__C": [0.01, 0.1, 1, 3],
+    "clf__class_weight": [None, "balanced", {0: 1, 1: 0.5}, {0: 1, 1: 0.25}],
+}
+
+grid = GridSearchCV(
+    estimator=pipeline,
+    param_grid=param_grid,
+    scoring="balanced_accuracy",
+    cv=10,
+    n_jobs=-1,
+    verbose=0,
+)
+
+grid.fit(X_train, y_train)
+
+save_model_gzip(grid, "files/models/model.pkl.gz")
+
+pred_train = grid.predict(X_train)
+pred_test = grid.predict(X_test)
+
+def metrics_dict(y_true, y_pred, dataset_name):
+    return {
+        "type": "metrics",
+        "dataset": dataset_name,
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1_score": float(f1_score(y_true, y_pred, zero_division=0)),
+    }
+
+
+def cm_dict(y_true, y_pred, dataset_name):
+    cm = confusion_matrix(y_true, y_pred)
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        tn = int(cm[0, 0]) if cm.shape[0] > 0 and cm.shape[1] > 0 else 0
+        fp = int(cm[0, 1]) if cm.shape[0] > 0 and cm.shape[1] > 1 else 0
+        fn = int(cm[1, 0]) if cm.shape[0] > 1 and cm.shape[1] > 0 else 0
+        tp = int(cm[1, 1]) if cm.shape[0] > 1 and cm.shape[1] > 1 else 0
+
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_name,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+    }
+
+
+rows = [
+    metrics_dict(y_train, pred_train, "train"),
+    metrics_dict(y_test, pred_test, "test"),
+    cm_dict(y_train, pred_train, "train"),
+    cm_dict(y_test, pred_test, "test"),
+]
+
+write_metrics_jsonlines(rows, "files/output/metrics.json")
